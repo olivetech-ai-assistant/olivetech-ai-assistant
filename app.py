@@ -87,8 +87,7 @@ with tab1:
         with st.chat_message("assistant"):
             st.write(ans)
         # Speak answer aloud in browser (TTS)
-        st.markdown(f"<script>try{{var u=new SpeechSynthesisUtterance({repr(ans[:500])});u.lang='en-US';window.speechSynthesis.speak(u);}}catch(e){{}}</script>", unsafe_allow_html=True)
-
+        
 # ============ TAB 2 - LEAD FORM ============
 with tab2:
     st.markdown("### 📝 Request a Service")
