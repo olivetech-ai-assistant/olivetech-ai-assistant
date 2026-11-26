@@ -1,292 +1,556 @@
-import os, re, io, base64, urllib.parse, requests
+import os, io, re, json, time, uuid, base64, hashlib, datetime
+from urllib.parse import quote
+
+import requests
 import streamlit as st
 import streamlit.components.v1 as components
-from supabase import create_client
-from datetime import datetime
+from PIL import Image
 
-st.set_page_config(page_title="OliveTech AI Assistant", page_icon="🤖", layout="centered", initial_sidebar_state="expanded")
-st.markdown("""
-<style>
-.block-container { padding-top: 0.6rem !important; padding-bottom: 1rem !important; max-width: 880px; }
-.topbar { display:flex; align-items:center; gap:10px; padding:4px 0 10px 0; border-bottom:1px solid #E8EDF2; margin-bottom:12px; }
-.topbar b { font-size:17px; color:#0F2A44; }
-.topbar span { font-size:13px; color:#6B7A8D; }
-.hero { text-align:center; padding:36px 12px 4px 12px; overflow:visible; }
-.hero h1 { font-size:2rem; color:#0F2A44; margin:10px 0 6px 0; line-height:1.25; padding-top:6px; }
-.hero p { color:#5B6B7E; font-size:15px; }
-.pill { display:inline-block; background:#EEF3F8; color:#0F2A44; padding:6px 12px; border-radius:20px; font-size:13px; font-weight:600; margin:3px 4px; }
-.success-box { background:#E6F4EA; border:1px solid #A8D5B5; color:#1A5C2E; padding:14px 16px; border-radius:12px; margin:12px 0; }
-div[data-testid="stSidebar"] { background-color:#F7F8FA; }
-div[data-testid="column"] button { height:44px !important; }
-@media (max-width:768px){ .block-container{padding-left:12px !important; padding-right:12px !important;} .hero h1{font-size:1.5rem !important;} }
-</style>
-""", unsafe_allow_html=True)
+st.set_page_config(page_title="OliveTech Assistant", page_icon="🫒", layout="centered")
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL","")
-SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY","")
-DIFY_API_KEY = os.environ.get("DIFY_API_KEY","")
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY","")
-supabase = None
-if SUPABASE_URL and SUPABASE_ANON_KEY:
-    try: supabase = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
-    except Exception: pass
 
-if "chats" not in st.session_state: st.session_state.chats=[{"title":"New Chat","messages":[],"created":datetime.now().strftime("%d %b %H:%M")}]
-if "active_chat" not in st.session_state: st.session_state.active_chat=0
-if "messages" not in st.session_state: st.session_state.messages=[]
-if "lang" not in st.session_state: st.session_state.lang="Tok Pisin + English (Auto)"
-if "mode" not in st.session_state: st.session_state.mode="chat"
-if "show_mic" not in st.session_state: st.session_state.show_mic=False
-if "show_upload" not in st.session_state: st.session_state.show_upload=False
-if "uploaded_context" not in st.session_state: st.session_state.uploaded_context=""
-if "uploaded_image_b64" not in st.session_state: st.session_state.uploaded_image_b64=None
-if "last_vision_error" not in st.session_state: st.session_state.last_vision_error=""
+def env(key, default=""):
+    return os.getenv(key, default).strip()
 
-def new_chat():
-    st.session_state.chats.insert(0, {"title":"New Chat","messages":[],"created":datetime.now().strftime("%d %b %H:%M")})
-    st.session_state.active_chat=0; st.session_state.messages=[]; st.session_state.mode="chat"
-def switch_chat(i):
-    st.session_state.active_chat=i; st.session_state.messages=st.session_state.chats[i]["messages"]; st.session_state.mode="chat"
 
-# ---------- HELPERS: image compress + vision + TTS ----------
-def compress_image_for_vision(data_bytes):
-    """Phone screenshots are 2-4MB PNG -> Groq rejects them. Compress to <1MB JPEG, max 1024px."""
+GROQ_KEY = env("GROQ_API_KEY")
+CHAT_MODEL = env("GROQ_CHAT_MODEL", "openai/gpt-oss-20b")
+VISION_MODEL = env("GROQ_VISION_MODEL", "qwen/qwen3.6-27b")
+STT_MODEL = env("GROQ_STT_MODEL", "whisper-large-v3-turbo")
+STT_LANG = env("STT_LANGUAGE", "en")
+SB_URL = re.sub(r"/rest/v1/?$", "", env("SUPABASE_URL").rstrip("/"))
+SB_KEY = env("SUPABASE_SERVICE_KEY")
+RESEND_KEY = env("RESEND_API_KEY")
+EMAIL_FROM = env("EMAIL_FROM", "OliveTech <onboarding@resend.dev>")
+EMAIL_TO = env("EMAIL_TO")
+WA_NUMBER = re.sub(r"\D", "", env("WHATSAPP_NUMBER"))
+BIZ_NAME = env("BUSINESS_NAME", "OliveTech Solutions")
+BIZ_INFO = env("BUSINESS_INFO", "OliveTech Solutions builds AI chatbots, workflow automation, AI agents and websites for small businesses in Papua New Guinea. Based in Wau, Morobe.")
+OPENAI_KEY = env("OPENAI_API_KEY")
+IMAGE_MODEL = env("IMAGE_MODEL", "gpt-image-1")
+IMAGE_QUALITY = env("IMAGE_QUALITY", "low")
+DAILY_IMG_CAP = int(env("DAILY_IMAGE_CAP", "20") or 20)
+SESSION_IMG_CAP = int(env("SESSION_IMAGE_CAP", "3") or 3)
+MAX_MESSAGES = 80
+SERVICES = ["AI Chatbot", "Workflow Automation", "AI Agent", "Website", "Other"]
+FILE_TYPES = ["jpg", "jpeg", "png", "webp", "pdf", "docx", "txt", "csv"]
+
+S = st.session_state
+S.setdefault("msgs", [])
+S.setdefault("img_n", 0)
+S.setdefault("last_lead", 0.0)
+S.setdefault("voice_text", "")
+S.setdefault("img_prompt", "")
+S.setdefault("pending", "")
+S.setdefault("last_img", None)
+S.setdefault("chat_id", uuid.uuid4().hex[:12])
+S.setdefault("hist", None)
+
+# Anonymous device code kept in the page link (?d=...). Bookmark the page to keep history.
+_d = st.query_params.get("d", "")
+if not re.fullmatch(r"[a-f0-9]{16}", _d or ""):
+    _d = uuid.uuid4().hex[:16]
+    st.query_params["d"] = _d
+S.device = _d
+
+
+@st.cache_resource
+def usage():
+    return {"day": "", "img": 0}
+
+
+def log(*a):
+    print(*a, flush=True)  # goes to Render logs only, never shown to visitors
+
+
+def now_utc():
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+# ---------- Tok Pisin detection ----------
+TPI_WORDS = set("""mi yu em ol mipela yupela yumi bilong blo laik ken inap olsem tru gutpela wanem wanpela
+tupela tripela stoa bisnis wok tasol nau pastaim planti sampela liklik helpim askim salim toktok mekim gat ating
+wantaim hamamas tenkiu tenkyu moni haus olgeta kisim lukim harim tokim painim wokim makim pikinini meri dispela
+displa sapos bagarap gen moa tude tumora asde apinun moning belo wanem inap bilong ating nogat yet""".split())
+TPI_WORDS.discard("yet")
+
+
+def looks_tok_pisin(text):
+    words = re.findall(r"[a-z']+", text.lower())
+    hits = sum(1 for w in words if w in TPI_WORDS)
+    return hits >= 2 or (len(words) <= 4 and hits >= 1)
+
+
+# ---------- AI helpers ----------
+def system_prompt(lang):
+    rule = {
+        "auto": "If the customer's latest message is in Tok Pisin, you MUST reply in Tok Pisin. If it is in English, reply in English. If it mixes both, reply in the main language they used.",
+        "tpi": "Always reply in Tok Pisin only.",
+        "en": "Always reply in English only.",
+    }[lang]
+    example = (
+        "Example of correct Tok Pisin style:\n"
+        "Customer: Mi laik wanpela AI chatbot bilong stoa bilong mi. Yu ken helpim mi?\n"
+        "Assistant: Yes, mipela inap helpim yu! Mipela mekim AI chatbot husait i ken bekim askim bilong ol kastama long Tok Pisin na English. "
+        "Plis go long Request a Service, putim nem na nambawan bilong yu, na mipela bai kontaktim yu."
+    )
+    return (
+        f"You are the friendly assistant for {BIZ_NAME} in Papua New Guinea. {rule} "
+        "Use short, simple sentences that are easy to read on a phone. "
+        "For facts about the business (prices, hours, services, location) use ONLY the business information below. "
+        "If the answer is not there, say you are not sure and suggest the Request a Service page. "
+        "Never invent prices, dates or promises. Do not present legal, medical or financial advice as certain.\n\n"
+        + example + "\n\nBUSINESS INFORMATION:\n" + BIZ_INFO
+    )
+
+
+def groq_chat(messages, model):
+    r = requests.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        headers={"Authorization": f"Bearer {GROQ_KEY}"},
+        json={"model": model, "messages": messages, "temperature": 0.4, "max_tokens": 1500},
+        timeout=60,
+    )
+    if r.status_code != 200:
+        log("GROQ CHAT ERROR", r.status_code, r.text[:300])
+        raise RuntimeError("chat failed")
+    text = (r.json()["choices"][0]["message"].get("content") or "").strip()
+    if not text:
+        raise RuntimeError("empty reply")
+    return text
+
+
+def transcribe(audio_bytes):
+    if len(audio_bytes) > 5 * 1024 * 1024:
+        raise ValueError("audio too large")
+    data = {
+        "model": STT_MODEL,
+        "temperature": "0",
+        "response_format": "json",
+        "prompt": "Tok Pisin and English: gutpela, hamamas, laik, bisnis, wok, mi, yu, stoa, moni.",
+    }
+    if STT_LANG:
+        data["language"] = STT_LANG
+    r = requests.post(
+        "https://api.groq.com/openai/v1/audio/transcriptions",
+        headers={"Authorization": f"Bearer {GROQ_KEY}"},
+        files={"file": ("audio.wav", audio_bytes, "audio/wav")},
+        data=data,
+        timeout=60,
+    )
+    if r.status_code != 200:
+        log("GROQ STT ERROR", r.status_code, r.text[:300])
+        raise RuntimeError("stt failed")
+    return r.json().get("text", "").strip()
+
+
+def read_file(f):
+    name = f.name.lower()
+    data = f.getvalue()
+    if len(data) > 8 * 1024 * 1024:
+        raise ValueError("too big")
+    if name.endswith((".jpg", ".jpeg", ".png", ".webp")):
+        img = Image.open(io.BytesIO(data)).convert("RGB")
+        img.thumbnail((1280, 1280))
+        q = 85
+        while True:
+            buf = io.BytesIO()
+            img.save(buf, "JPEG", quality=q)
+            if buf.tell() < 900_000 or q <= 40:
+                break
+            q -= 15
+        return "image", base64.b64encode(buf.getvalue()).decode()
+    if name.endswith(".pdf"):
+        import fitz
+        doc = fitz.open(stream=data, filetype="pdf")
+        return "text", "\n".join(p.get_text() for p in doc)[:12000]
+    if name.endswith(".docx"):
+        import docx
+        d = docx.Document(io.BytesIO(data))
+        return "text", "\n".join(p.text for p in d.paragraphs)[:12000]
+    if name.endswith((".txt", ".csv")):
+        return "text", data.decode("utf-8", "ignore")[:12000]
+    raise ValueError("unsupported")
+
+
+def make_image(prompt):
+    r = requests.post(
+        "https://api.openai.com/v1/images/generations",
+        headers={"Authorization": f"Bearer {OPENAI_KEY}"},
+        json={"model": IMAGE_MODEL, "prompt": prompt, "size": "1024x1024", "quality": IMAGE_QUALITY, "n": 1},
+        timeout=150,
+    )
+    if r.status_code != 200:
+        log("IMAGE ERROR", r.status_code, r.text[:300])
+        raise RuntimeError("image failed")
+    return base64.b64decode(r.json()["data"][0]["b64_json"])
+
+
+def listen_button(text):
+    safe = json.dumps(text).replace("</", "<\\/")
+    components.html(
+        """<button id="b" style="padding:6px 12px;border:1px solid #ccc;border-radius:8px;background:#fff;cursor:pointer;font-size:14px">🔊 Listen</button>
+<script>
+const t = %s;
+document.getElementById('b').onclick = () => {
+  if (!('speechSynthesis' in window)) { alert('Listen is not supported on this phone. Please read the text.'); return; }
+  speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(t);
+  u.lang = 'en-US'; u.rate = 0.95;
+  speechSynthesis.speak(u);
+};
+</script>""" % safe,
+        height=44,
+    )
+
+
+# ---------- Database helpers (Supabase) ----------
+def sb_ready():
+    return bool(SB_URL and SB_KEY)
+
+
+def sb_headers(prefer="return=minimal"):
+    h = {"apikey": SB_KEY, "Content-Type": "application/json", "Prefer": prefer}
+    if SB_KEY.startswith("eyJ"):  # legacy JWT keys also need the Authorization header
+        h["Authorization"] = f"Bearer {SB_KEY}"
+    return h
+
+
+def sb(method, table, params=None, body=None, prefer="return=minimal"):
+    r = requests.request(method, f"{SB_URL}/rest/v1/{table}", headers=sb_headers(prefer),
+                         params=params, json=body, timeout=20)
+    if r.status_code not in (200, 201, 204):
+        log("SUPABASE ERROR", method, table, r.status_code, r.text[:300])
+        raise RuntimeError(f"database error {r.status_code}")
+    return r.json() if r.text else None
+
+
+def msg_row(role, content, chat_id, ts, kind="chat"):
+    return {"device_id": S.device, "chat_id": chat_id, "role": role,
+            "content": content[:7500], "kind": kind, "created_at": ts.isoformat()}
+
+
+def save_history(rows):
+    if not sb_ready():
+        return
     try:
-        from PIL import Image
-        img = Image.open(io.BytesIO(data_bytes)).convert("RGB")
-        img.thumbnail((1024,1024), Image.LANCZOS)
-        buf = io.BytesIO(); img.save(buf, format="JPEG", quality=82, optimize=True)
-        return buf.getvalue()
-    except Exception:
-        return data_bytes
-
-def extract_file_content(uploaded):
-    try:
-        name = uploaded.name.lower(); data = uploaded.getvalue()
-        if name.endswith((".png",".jpg",".jpeg",".webp")):
-            comp = compress_image_for_vision(data)
-            b64 = base64.b64encode(comp).decode("utf-8")
-            return (f"[IMAGE attached: {uploaded.name}, {len(data)//1024}KB -> compressed {len(comp)//1024}KB. WILL be sent to vision.]", b64)
-        if name.endswith((".txt",".csv")):
-            return ("File content:\n"+data.decode("utf-8",errors="ignore")[:8000], None)
-        if name.endswith(".pdf"):
-            try:
-                import fitz; doc = fitz.open(stream=data, filetype="pdf"); txt=""
-                for pg in doc: txt+=pg.get_text()+"\n"
-                return ("PDF content:\n"+txt[:8000] if txt.strip() else "[PDF has no readable text - may be scanned images.]", None)
-            except Exception as e: return (f"[PDF could not be read: {e}]", None)
-        if name.endswith(".docx"):
-            try:
-                from docx import Document; doc=Document(io.BytesIO(data)); txt="\n".join([p.text for p in doc.paragraphs])
-                return ("DOCX content:\n"+txt[:8000], None)
-            except Exception as e: return (f"[DOCX could not be read: {e}]", None)
-        if name.endswith(".xlsx"):
-            try:
-                import pandas as pd; df=pd.read_excel(io.BytesIO(data))
-                return ("XLSX content:\n"+df.head(30).to_string()[:8000], None)
-            except Exception as e: return (f"[XLSX could not be read: {e}]", None)
-        return (f"File {uploaded.name} attached.", None)
+        sb("POST", "chat_messages", body=rows)
     except Exception as e:
-        return (f"[Could not read file: {e}]", None)
+        log("HISTORY SAVE FAILED", e)
 
-def ask_groq_vision(prompt, sys_prompt, image_b64, api_key):
-    """Returns (answer_or_None, error). Tries 4 vision models."""
-    errors=[]
-    for model_name in ["meta-llama/llama-4-maverick-17b-128e-instruct","meta-llama/llama-4-scout-17b-16e-instruct","llama-3.2-90b-vision-preview","llama-3.2-11b-vision-preview"]:
-        try:
-            payload={"model":model_name,"messages":[
-                {"role":"system","content":sys_prompt},
-                {"role":"user","content":[
-                    {"type":"text","text":prompt+"\n\nYou CAN see this image. Look carefully and explain EXACTLY what is on it: if photo, describe people, place, objects, actions. If poster/flyer, read ALL text: title, date, price, phone, location, main message. If screenshot, explain what app/page it shows and key info. Be specific with names, numbers, dates you can read. Do NOT say you cannot view images. If some text is blurry, say which part, but describe the rest."},
-                    {"type":"image_url","image_url":{"url":f"data:image/jpeg;base64,{image_b64}"}}]}],
-                "temperature":0.5,"max_tokens":1200}
-            r=requests.post("https://api.groq.com/openai/v1/chat/completions",headers={"Authorization":f"Bearer {api_key.strip()}","Content-Type":"application/json"},json=payload,timeout=90)
-            if r.status_code==200: return (r.json()["choices"][0]["message"]["content"],"")
-            try: errors.append(f"{model_name} -> {r.status_code}: {r.json().get('error',{}).get('message',r.text[:250])}")
-            except Exception: errors.append(f"{model_name} -> {r.status_code}: {r.text[:250]}")
-        except Exception as e: errors.append(f"{model_name} exception: {e}")
-    return (None," | ".join(errors))
 
-def text_to_speech_bytes(text):
-    """Voice RESPONSE: gTTS free. Returns mp3 bytes or None."""
+def load_chat_list():
     try:
-        from gtts import gTTS
-        clean=re.sub(r'[*#`_\[\]()<>]',' ',text or ""); clean=re.sub(r'http\S+',' ',clean); clean=re.sub(r'\s+',' ',clean).strip()[:1200]
-        if not clean: return None
-        buf=io.BytesIO(); tts=gTTS(text=clean,lang="en",slow=False); tts.write_to_fp(buf); buf.seek(0); return buf.getvalue()
+        rows = sb("GET", "chat_messages", params={
+            "device_id": f"eq.{S.device}", "kind": "eq.chat", "select": "chat_id,role,content,created_at",
+            "order": "created_at.desc", "limit": "400"}) or []
     except Exception:
         return None
+    chats = {}
+    for r in rows:  # newest first, so the last user message seen per chat is the first one asked
+        c = chats.setdefault(r["chat_id"], {"id": r["chat_id"], "last": r["created_at"], "title": ""})
+        if r["role"] == "user":
+            c["title"] = r["content"]
+    return sorted(chats.values(), key=lambda c: c["last"], reverse=True)[:15]
 
-# ---------- SIDEBAR ----------
+
+def new_chat():
+    S.msgs = []
+    S.chat_id = uuid.uuid4().hex[:12]
+    S.hist = None
+
+
+def open_chat(cid):
+    try:
+        rows = sb("GET", "chat_messages", params={
+            "device_id": f"eq.{S.device}", "chat_id": f"eq.{cid}", "kind": "eq.chat",
+            "select": "role,content", "order": "created_at.asc", "limit": "200"}) or []
+        S.msgs = [{"role": r["role"], "content": r["content"]} for r in rows]
+        S.chat_id = cid
+    except Exception:
+        pass
+
+
+def delete_history():
+    try:
+        sb("DELETE", "chat_messages", params={"device_id": f"eq.{S.device}"})
+        S.msgs = []
+        S.chat_id = uuid.uuid4().hex[:12]
+        S.hist = None
+    except Exception:
+        pass
+
+
+def save_lead(row):
+    return sb("POST", "leads", body=row, prefer="return=representation")[0]["id"]
+
+
+def set_status(lead_id, status):
+    try:
+        sb("PATCH", "leads", params={"id": f"eq.{lead_id}"}, body={"notification_status": status})
+    except Exception as e:
+        log("STATUS UPDATE ERROR", e)
+
+
+def send_email(row):
+    r = requests.post(
+        "https://api.resend.com/emails",
+        headers={"Authorization": f"Bearer {RESEND_KEY}"},
+        json={
+            "from": EMAIL_FROM,
+            "to": [EMAIL_TO],
+            "subject": f"New lead: {row['name']} - {row['service']}",
+            "text": f"Name: {row['name']}\nPhone: {row['phone']}\nService: {row['service']}\nMessage: {row['message']}",
+        },
+        timeout=20,
+    )
+    if r.status_code not in (200, 201):
+        log("RESEND ERROR", r.status_code, r.text[:300])
+        raise RuntimeError("email failed")
+
+
+# ---------- Sidebar ----------
+if S.hist is None and sb_ready():
+    _res = load_chat_list()
+    S.hist = _res if _res is not None else "ERR"
+
 with st.sidebar:
-    try: st.image("Logo.jpg", width=100)
-    except Exception: st.markdown("### 🤖 OliveTech")
-    st.markdown("**OliveTech**"); st.caption("AI Solutions • Wau-Waria, PNG")
-    if st.button("➕  New Chat", use_container_width=True): new_chat(); st.rerun()
-    st.markdown("### 🕘 History")
-    for idx,c in enumerate(st.session_state.chats):
-        label=c["title"] if c["title"]!="New Chat" else f"New Chat • {c['created']}"
-        if c["messages"]:
-            first=next((m["content"] for m in c["messages"] if m["role"]=="user"),"")
-            if first: label=(first[:34]+"…") if len(first)>34 else first
-        is_active="✅ " if idx==st.session_state.active_chat else ""
-        if st.button(f"{is_active}{label}", key=f"hist_{idx}", use_container_width=True): switch_chat(idx); st.rerun()
-    if st.button("🗑️ Clear History", use_container_width=True):
-        st.session_state.chats=[{"title":"New Chat","messages":[],"created":datetime.now().strftime("%d %b %H:%M")}]; st.session_state.active_chat=0; st.session_state.messages=[]; st.rerun()
-    st.divider(); st.markdown("### 🌐 Toktok / Language")
-    st.session_state.lang=st.radio("Choose language:",["Tok Pisin + English (Auto)","Tok Pisin tasol","English only"],index=0)
-    st.caption("Auto = Yu toktok Tok Pisin, AI bai bekim Tok Pisin.")
-    st.divider(); st.markdown("**Willie Den** — Founder"); st.caption("📞 +675 7741 4389\n✉️ olivetech.1126@gmail.com\n🌐 olivetech.com.pg")
+    st.title("🫒 OliveTech")
+    lang = st.radio(
+        "Toktok / Language",
+        ["auto", "tpi", "en"],
+        format_func=lambda k: {"auto": "Tok Pisin + English (auto)", "tpi": "Tok Pisin tasol", "en": "English only"}[k],
+    )
+    st.button("➕ New chat", on_click=new_chat)
+    st.markdown("**History**")
+    if not sb_ready() or S.hist == "ERR":
+        st.caption("History is not available right now.")
+    elif not S.hist:
+        st.caption("No saved chats yet.")
+    else:
+        for c in S.hist:
+            label = ("▶ " if c["id"] == S.chat_id else "") + ((c["title"] or "Chat")[:38])
+            st.button(label, key=f"h_{c['id']}", on_click=open_chat, args=(c["id"],))
+        st.button("🗑 Delete my history", on_click=delete_history)
+    st.caption("Chats are saved so you can reopen them here. Bookmark this page to keep your history. "
+               "Anyone with this page link can see it, so do not share the link. "
+               "Pilot version: AI can make mistakes, so check prices, dates and important details. "
+               "If the first load is slow, wait one minute and refresh. "
+               "Please do not share passwords, bank details or other sensitive information.")
 
-st.markdown('<div class="topbar"><b>🤖 OliveTech Assistant</b><span>• Wau-Waria, PNG • +675 7741 4389</span></div>', unsafe_allow_html=True)
+CHAT, IMG, LEAD = "💬 Chat", "🎨 Create image", "📝 Request a Service"
+page = st.radio("Page", [CHAT, IMG, LEAD], horizontal=True, label_visibility="collapsed")
 
-if not st.session_state.messages and st.session_state.mode=="chat":
-    st.markdown("""<div class="hero"><h1>Gutpela dei! 👋</h1><p>Askim long Tok Pisin o English — AI bai bekim long sem tok yu yusim.<br>Ask, create, or build anything for your business.</p></div>""", unsafe_allow_html=True)
-    st.markdown('<div style="text-align:center;"><span class="pill">AI Chatbots</span><span class="pill">Workflow Automation</span><span class="pill">AI Agents</span><span class="pill">Websites</span></div>', unsafe_allow_html=True)
-    st.write("")
 
-# ---------- CHAT HISTORY + 🔊 LISTEN ----------
-if st.session_state.mode=="chat":
-    for idx_msg,m in enumerate(st.session_state.messages):
+def queue_voice():
+    S.pending = S.voice_text.strip()
+    S.voice_text = ""
+
+
+# ---------- Chat page ----------
+if page == CHAT:
+    if not S.msgs:
+        st.markdown("## Gutpela dei! 👋")
+        st.write("Askim mi long Tok Pisin o English. Yu ken toktok, o salim poto o fail tu.")
+    for m in S.msgs:
         with st.chat_message(m["role"]):
             st.markdown(m["content"])
-            if m.get("file_name"): st.caption(f"📎 {m['file_name']}")
-            if m["role"]=="assistant":
-                if st.button("🔊  Listen to this answer", key=f"listen_{idx_msg}"):
-                    with st.spinner("Generating voice..."):
-                        ab=text_to_speech_bytes(m["content"])
-                        if ab: st.audio(ab, format="audio/mp3")
-                        else: st.warning("Voice could not be generated. Try again.")
+            if m["role"] == "assistant" and not m.get("err"):
+                listen_button(m["content"])
 
-# ---------- LEAD FORM ----------
-if st.session_state.mode=="lead":
-    st.subheader("📝 Request a Service"); st.caption("Fillim dispela na OliveTech bai kontakim yu. WhatsApp confirmation bai op automatically.")
-    name=st.text_input("Your name *", key="lead_name"); phone=st.text_input("Phone / WhatsApp *", key="lead_phone", placeholder="e.g. 7741 4389")
-    service=st.selectbox("Service needed",["AI Chatbot","Workflow Automation","AI Agent","AI Agents","Website","Other"], key="lead_service")
-    message=st.text_area("Message - Tell us about your business", key="lead_message", placeholder="e.g. I need an AI Agent for my trade store")
-    if st.button("Send Request & Confirm on WhatsApp", type="primary", use_container_width=True):
-        if not name or not phone: st.warning("Please fill in your name and phone.")
-        elif supabase is None: st.error("Supabase is not connected.")
-        else:
+    with st.expander("🎤 Speak instead of typing"):
+        audio = st.audio_input("Record a short message (about 30 seconds)")
+        if audio is not None:
+            raw = audio.getvalue()
+            h = hashlib.md5(raw).hexdigest()
+            if S.get("audio_hash") != h:
+                S.audio_hash = h
+                try:
+                    S.voice_text = transcribe(raw)
+                except Exception:
+                    st.error("Sori, mi no harim gut. Please type your message instead.")
+        st.text_area("Check and fix your message, then send:", key="voice_text", max_chars=600)
+        st.button("Send voice message", on_click=queue_voice)
+
+    box = st.chat_input("Askim long Tok Pisin o English...", accept_file=True, file_type=FILE_TYPES)
+    text, files = "", []
+    if S.pending:
+        text, S.pending = S.pending, ""
+    if box:
+        text = (box.text or "").strip() or text
+        files = list(box.files or [])
+
+    if text or files:
+        if len(S.msgs) >= MAX_MESSAGES:
+            st.warning("This chat is long. Please tap New chat to continue.")
+            st.stop()
+        text = text or "Explain exactly what is in this file."
+        user_content, model, shown = text, CHAT_MODEL, text
+        if files:
+            f = files[0]
             try:
-                supabase.table("leads").insert({"name":name,"phone":phone,"service":service,"message":message}).execute()
-                st.markdown('<div class="success-box">✅ <b>Thank you! Your request was saved.</b><br>Willie Den will contact you. WhatsApp confirmation is opening...</div>', unsafe_allow_html=True)
-                wa_text=f"Hi OliveTech, I just sent a request. I am {name} ({phone}), I need {service}. My message: {message}. Please confirm you received my request."
-                wa_url="https://wa.me/67577414389?text="+urllib.parse.quote(wa_text)
-                components.html(f"<script>window.open({repr(wa_url)}, '_blank');</script>", height=0)
-                st.link_button("💬 Open WhatsApp Confirmation", wa_url, use_container_width=True)
-            except Exception as e: st.error(f"Could not save: {e}")
-
-# ---------- SMART COMPOSER - IN MIDDLE, Enter works ----------
-st.write("")
-tb_plus, tb_fast, tb_mic, tb_help = st.columns([1.0,1.4,1.0,3.6], gap="small")
-with tb_plus:
-    if st.button("+  Attach", key="plus_btn2", use_container_width=True):
-        st.session_state.show_upload=not st.session_state.show_upload; st.session_state.show_mic=False; st.rerun()
-with tb_fast:
-    speed=st.selectbox("speed",["Fast","Smart","Balanced"], label_visibility="collapsed", key="composer_speed")
-with tb_mic:
-    if st.button("🎤  Speak", key="mic_btn2", use_container_width=True):
-        st.session_state.show_mic=not st.session_state.show_mic
-        if st.session_state.show_mic: st.session_state.show_upload=False
-        st.rerun()
-with tb_help:
-    st.caption("➕ = file  •  🎤 = voice  •  Press **Enter** to send")
-# Form with ONLY ONE submit button -> Enter triggers Send (not +)
-with st.form("composer_form_middle", clear_on_submit=False):
-    c_text, c_send = st.columns([5.5,0.7], gap="small")
-    with c_text:
-        composer_text=st.text_input("composer", placeholder="Ask, create images, or build anything...  (Press Enter to send)", label_visibility="collapsed", key="composer_text")
-    with c_send:
-        send_clicked=st.form_submit_button("➤", type="primary", use_container_width=True)
-
-# Upload panel BELOW bar
-uploaded=None
-if st.session_state.show_upload:
-    st.caption("📎 Attach a file — image, PDF, TXT, DOCX, CSV, XLSX")
-    uploaded=st.file_uploader("Attach a file", type=["png","jpg","jpeg","pdf","txt","docx","csv","xlsx"], label_visibility="collapsed", key="composer_upload")
-    if uploaded is not None:
-        txt_ctx, img_b64 = extract_file_content(uploaded)
-        st.session_state.uploaded_context=txt_ctx; st.session_state.uploaded_image_b64=img_b64; st.session_state.last_vision_error=""
-        if img_b64:
-            st.image(uploaded, width=200)
-            st.caption(f"📎 Attached: {uploaded.name} ✅ — AI will REALLY look at this image (compressed for Vision). Now type your question and press Enter or tap ➤")
-        else:
-            st.caption(f"📎 Attached: {uploaded.name} ✅ — AI will read this file. Now type your question and press Enter or tap ➤")
-
-# Mic panel BELOW bar - natural voice
-transcribed=""
-if st.session_state.show_mic:
-    st.caption("🎤 Tap to record — toktok natural, no need to shout. AI bai transleit-im.")
-    audio=st.audio_input("Tap to record your voice", label_visibility="collapsed", key="mic_audio")
-    if audio is not None and GROQ_API_KEY:
-        with st.spinner("Listening... Transcribing your natural voice..."):
-            try:
-                files={"file":(audio.name if hasattr(audio,"name") else "voice.wav", audio.getvalue(), "audio/wav")}
-                data={"model":"whisper-large-v3","language":"en","prompt":"Tok Pisin and English mixed conversation from Papua New Guinea. Words like gutpela, hamamas, laik, bisnis, wok, helpim, yu, mi."}
-                r=requests.post("https://api.groq.com/openai/v1/audio/transcriptions",headers={"Authorization":f"Bearer {GROQ_API_KEY}"},data=data,files=files,timeout=60)
-                if r.status_code==200:
-                    transcribed=r.json().get("text",""); st.success(f"You said: {transcribed}"); st.session_state.show_mic=False
-                else: st.warning("Voice failed. Please type instead.")
-            except Exception as e: st.warning(f"Voice error: {e}")
-    elif audio is not None and not GROQ_API_KEY:
-        st.warning("GROQ_API_KEY is not set in Render. Voice is off, please type.")
-
-# Below-bar buttons
-b_chat, b_lead = st.columns(2, gap="small")
-with b_chat:
-    if st.button("💬  AI Assistant", use_container_width=True, type="primary" if st.session_state.mode=="chat" else "secondary"): st.session_state.mode="chat"; st.rerun()
-with b_lead:
-    if st.button("📝  Request a Service", use_container_width=True, type="primary" if st.session_state.mode=="lead" else "secondary"): st.session_state.mode="lead"; st.rerun()
-st.caption("➕ = Attach a file  •  🎤 = Speak  •  Fast = Quick answer, Smart = Deeper answer")
-
-# ---------- SEND ----------
-prompt = transcribed if transcribed else (composer_text.strip() if (send_clicked and composer_text and composer_text.strip()) else None)
-if prompt and st.session_state.mode=="chat":
-    if not st.session_state.messages: st.session_state.chats[st.session_state.active_chat]["title"]=prompt[:40]
-    file_ctx=st.session_state.uploaded_context
-    msg={"role":"user","content":prompt}
-    if file_ctx:
-        import re as _re; _m=_re.search(r"IMAGE attached: ([^,]+)", file_ctx); msg["file_name"]=_m.group(1) if _m else "Attached file"
-    st.session_state.messages.append(msg); st.session_state.chats[st.session_state.active_chat]["messages"]=st.session_state.messages
-    st.session_state.uploaded_context=""
-    if st.session_state.lang=="Tok Pisin tasol":
-        sys_prompt="You are OliveTech Assistant, Wau-Waria PNG. Answer ONLY in fluent, correct PNG Tok Pisin. Use gutpela, hamamas, laik, ken, bai, tasol, olsem, helpim, wok, bisnis."
-    elif st.session_state.lang=="English only":
-        sys_prompt="You are OliveTech Assistant, Wau-Waria PNG. Answer ONLY in clear English."
-    else:
-        sys_prompt="You are OliveTech Assistant, Wau-Waria PNG. Match the user's language exactly. If user writes Tok Pisin, answer in fluent, correct PNG Tok Pisin. If English, answer in clear English. Be helpful, short, friendly, professional."
-    full_prompt=prompt+(f"\n\n[Attached file context: {file_ctx}]" if file_ctx else "")
-    if speed=="Smart": models=["openai/gpt-oss-120b","llama-3.1-8b-instant"]
-    elif speed=="Balanced": models=["llama-3.1-8b-instant","openai/gpt-oss-120b"]
-    else: models=["llama-3.1-8b-instant","openai/gpt-oss-120b"]
-    ans=None; groq_error=""; vision_err=""
-    if st.session_state.get("uploaded_image_b64") and GROQ_API_KEY:
-        ans, vision_err = ask_groq_vision(full_prompt, sys_prompt, st.session_state.uploaded_image_b64, GROQ_API_KEY)
-        if ans: st.session_state.uploaded_image_b64=None
-        else: st.session_state.last_vision_error=vision_err
-    if ans is None and GROQ_API_KEY:
-        for model_name in models:
-            try:
-                r=requests.post("https://api.groq.com/openai/v1/chat/completions",headers={"Authorization":f"Bearer {GROQ_API_KEY.strip()}","Content-Type":"application/json"},json={"model":model_name,"messages":[{"role":"system","content":sys_prompt},{"role":"user","content":full_prompt}],"temperature":0.7,"max_tokens":900},timeout=60)
-                if r.status_code==200: ans=r.json()["choices"][0]["message"]["content"]; break
+                kind, val = read_file(f)
+                shown = f"{text}\n\n📎 {f.name}"
+                if kind == "image":
+                    model = VISION_MODEL
+                    user_content = [
+                        {"type": "text", "text": text},
+                        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + val}},
+                    ]
                 else:
-                    try: groq_error=f"Groq {model_name} -> {r.status_code}: {r.json().get('error',{}).get('message',r.text[:200])}"
-                    except Exception: groq_error=f"Groq {model_name} -> {r.status_code}: {r.text[:200]}"
-            except Exception as e: groq_error=f"Groq {model_name} exception: {e}"
-    if ans is None and DIFY_API_KEY:
-        try:
-            r=requests.post("https://api.dify.ai/v1/chat-messages",headers={"Authorization":f"Bearer {DIFY_API_KEY}","Content-Type":"application/json"},json={"inputs":{},"query":full_prompt,"response_mode":"blocking","user":"olivetech-web"},timeout=60)
-            if r.status_code==200: ans=r.json().get("answer")
-        except Exception: pass
-    if ans is None:
-        ans="Sori, AI i no bekim nau. Traim gen liklik taim o WhatsAppim mipela long +675 7741 4389."
-        if groq_error or st.session_state.get("last_vision_error"):
-            with st.expander("🔧 Debug - Why AI failed (tap to see)", expanded=True):
-                if groq_error: st.code("TEXT MODEL: "+groq_error)
-                if st.session_state.get("last_vision_error"): st.code("VISION MODEL: "+str(st.session_state.get("last_vision_error"))[:2000])
-                st.caption(f"Image bytes stored? {'YES' if st.session_state.get('uploaded_image_b64') else 'NO'}")
-    st.session_state.messages.append({"role":"assistant","content":ans}); st.session_state.chats[st.session_state.active_chat]["messages"]=st.session_state.messages
-    st.rerun()
+                    user_content = f"{text}\n\nFILE CONTENT:\n{val}"
+            except Exception:
+                st.warning("Sori, mi no inap ridim dispela fail. Try a JPG, PNG, PDF, DOCX, TXT or CSV under 8 MB.")
+                st.stop()
 
-st.divider(); st.caption("OliveTech • olivetech.1126@gmail.com • +675 7741 4389 • olivetech.com.pg")
+        nudge = ""
+        if lang == "tpi" or (lang == "auto" and looks_tok_pisin(text)):
+            nudge = "\n\n(Reply in simple, correct Tok Pisin.)"
+        elif lang == "en":
+            nudge = "\n\n(Reply in English.)"
+        if isinstance(user_content, list):
+            user_content[0]["text"] += nudge
+        else:
+            user_content += nudge
+
+        history = [{"role": m["role"], "content": m["content"]} for m in S.msgs[-12:] if not m.get("err")]
+        S.msgs.append({"role": "user", "content": shown})
+        messages = [{"role": "system", "content": system_prompt(lang)}] + history + [{"role": "user", "content": user_content}]
+        ok = True
+        with st.spinner("Wait liklik..."):
+            try:
+                answer = groq_chat(messages, model)
+            except Exception:
+                ok = False
+                answer = "Sori, AI i no bekim nau. Traim gen long sampela minit. (Sorry, the assistant is not available right now. Please try again shortly.)"
+        S.msgs.append({"role": "assistant", "content": answer, "err": not ok})
+        if ok:
+            t = now_utc()
+            save_history([
+                msg_row("user", shown, S.chat_id, t),
+                msg_row("assistant", answer, S.chat_id, t + datetime.timedelta(milliseconds=5)),
+            ])
+            S.hist = None
+        st.rerun()
+
+# ---------- Image page ----------
+elif page == IMG:
+    st.subheader("🎨 Create image by voice or text")
+    if not OPENAI_KEY:
+        st.info("Create image is coming soon.")
+    else:
+        st.caption("Image creation uses paid credits and is limited per visit and per day.")
+        a = st.audio_input("Speak your image idea (optional)", key="img_audio")
+        if a is not None:
+            raw = a.getvalue()
+            h = hashlib.md5(raw).hexdigest()
+            if S.get("img_audio_hash") != h:
+                S.img_audio_hash = h
+                try:
+                    S.img_prompt = transcribe(raw)
+                except Exception:
+                    st.error("Sori, mi no harim gut. Please type your idea instead.")
+        st.text_area("Image idea (check and edit before creating):", key="img_prompt", max_chars=400,
+                     placeholder="Example: a colourful poster for a coffee shop in Wau")
+        if st.button("Create image"):
+            u = usage()
+            today = str(datetime.date.today())
+            if u["day"] != today:
+                u["day"], u["img"] = today, 0
+            prompt = S.img_prompt.strip()
+            if not prompt:
+                st.warning("Please say or type your image idea first.")
+            elif S.img_n >= SESSION_IMG_CAP or u["img"] >= DAILY_IMG_CAP:
+                st.warning("Image limit reached for now. Please try again tomorrow.")
+            else:
+                with st.spinner("Creating your image..."):
+                    try:
+                        S.last_img = make_image(prompt)
+                        S.img_n += 1
+                        u["img"] += 1
+                        save_history([msg_row("user", prompt, "images", now_utc(), "image")])
+                    except Exception:
+                        st.error("Sori, image creation is not available now. Your idea is saved above, try again soon.")
+        if S.last_img:
+            st.image(S.last_img)
+            st.download_button("Download image", S.last_img, file_name="olivetech-image.png", mime="image/png")
+        if sb_ready():
+            try:
+                recent = sb("GET", "chat_messages", params={
+                    "device_id": f"eq.{S.device}", "kind": "eq.image", "select": "content,created_at",
+                    "order": "created_at.desc", "limit": "5"}) or []
+            except Exception:
+                recent = []
+            if recent:
+                with st.expander("Your recent image ideas"):
+                    for r in recent:
+                        st.write(f"• {r['created_at'][:10]} · {r['content'][:80]}")
+
+# ---------- Request a Service page ----------
+else:
+    st.subheader("📝 Request a Service")
+    with st.form("lead", clear_on_submit=True):
+        name = st.text_input("Name", max_chars=80)
+        phone = st.text_input("Phone (WhatsApp if possible)", max_chars=20)
+        service = st.selectbox("Service", SERVICES)
+        message = st.text_area("Tell us what you need", max_chars=1000)
+        go = st.form_submit_button("Send request")
+    if go:
+        name, phone, message = name.strip(), phone.strip(), message.strip()
+        if len(name) < 2 or not re.fullmatch(r"\+?[0-9 ]{7,15}", phone):
+            st.error("Please enter your name and a valid phone number.")
+        elif time.time() - S.last_lead < 60:
+            st.warning("Please wait a minute before sending another request.")
+        else:
+            row = {"name": name, "phone": phone, "service": service, "message": message, "device_id": S.device}
+            try:
+                lead_id = save_lead(row)
+                S.last_lead = time.time()
+                try:
+                    send_email(row)
+                    set_status(lead_id, "email_sent")
+                except Exception:
+                    set_status(lead_id, "email_failed")
+                st.success("Tenkiu! We got your request and will contact you soon.")
+                if WA_NUMBER:
+                    wa = f"Hello {BIZ_NAME}, my name is {name}. Phone: {phone}. Service: {service}. {message}"
+                    st.link_button("💬 Confirm on WhatsApp (tap Send there)", f"https://wa.me/{WA_NUMBER}?text={quote(wa)}")
+            except Exception as e:
+                st.error(f"Sori, we could not save your request. Please try again or contact us on WhatsApp. ({e})")
+    if sb_ready():
+        try:
+            mine = sb("GET", "leads", params={
+                "device_id": f"eq.{S.device}", "select": "created_at,service,message",
+                "order": "created_at.desc", "limit": "5"}) or []
+        except Exception:
+            mine = []
+        if mine:
+            with st.expander("Your recent requests"):
+                for r in mine:
+                    st.write(f"• {r['created_at'][:10]} · {r['service']} · {(r.get('message') or '')[:60]}")
+
+# ---------- Diagnostics: add ?debug=1 to the page link ----------
+if st.query_params.get("debug") == "1":
+    with st.sidebar:
+        st.markdown("**Diagnostics**")
+        try:
+            for nm, val in [("GROQ_API_KEY", GROQ_KEY), ("SUPABASE_URL", SB_URL), ("SUPABASE_SERVICE_KEY", SB_KEY),
+                            ("RESEND_API_KEY", RESEND_KEY), ("EMAIL_TO", EMAIL_TO)]:
+                st.write(f"{nm}: {'set' if val else 'MISSING'}")
+            if GROQ_KEY:
+                r = requests.get("https://api.groq.com/openai/v1/models",
+                                 headers={"Authorization": f"Bearer {GROQ_KEY}"}, timeout=20)
+                st.write("Groq key test:", r.status_code)
+                if r.status_code == 200:
+                    ids = [m["id"] for m in r.json().get("data", [])]
+                    st.write("Chat model found:", CHAT_MODEL in ids)
+                    st.write("Vision model found:", VISION_MODEL in ids)
+                    st.write("Voice model found:", STT_MODEL in ids)
+            if sb_ready():
+                for tbl in ("leads", "chat_messages"):
+                    r = requests.get(f"{SB_URL}/rest/v1/{tbl}?select=id&limit=1", headers=sb_headers(), timeout=20)
+                    st.write(f"Supabase {tbl}:", r.status_code)
+                    if r.status_code != 200:
+                        st.write(r.text[:200])
+        except Exception as e:
+            st.write("Diagnostic error:", str(e)[:200])
